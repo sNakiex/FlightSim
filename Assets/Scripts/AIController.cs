@@ -1,6 +1,9 @@
-﻿using System.Collections;
+﻿using System;
+using System.Collections;
 using System.Collections.Generic;
+using TMPro;
 using UnityEngine;
+using UnityEngine.Windows;
 
 public class AIController : MonoBehaviour {
     [SerializeField]
@@ -32,6 +35,8 @@ public class AIController : MonoBehaviour {
     [SerializeField]
     float rollFactor;
     [SerializeField]
+    float yawFactor;
+    [SerializeField]
     bool canUseMissiles;
     [SerializeField]
     bool canUseCannon;
@@ -57,6 +62,12 @@ public class AIController : MonoBehaviour {
     float cannonBurstCooldown;
     [SerializeField]
     float minMissileDodgeDistance;
+    [SerializeField]
+    float reactionDelayMin;
+    [SerializeField]
+    float reactionDelayMax;
+    [SerializeField]
+    float reactionDelayDistance;
 
     Target selfTarget;
     Plane targetPlane;
@@ -70,6 +81,15 @@ public class AIController : MonoBehaviour {
     float cannonBurstTimer;
     float cannonCooldownTimer;
 
+    struct ControlInput {
+        public float time;
+        public Vector3 targetPosition;
+    }
+
+    Queue<ControlInput> inputQueue;
+
+    bool dodging;
+    Vector3 lastDodgePoint;
     List<Vector3> dodgeOffsets;
     const float dodgeUpdateInterval = 0.25f;
     float dodgeTimer;
@@ -82,6 +102,7 @@ public class AIController : MonoBehaviour {
         }
 
         dodgeOffsets = new List<Vector3>();
+        inputQueue = new Queue<ControlInput>();
     }
 
     Vector3 AvoidGround() {
@@ -125,6 +146,7 @@ public class AIController : MonoBehaviour {
         var errorDir = error.normalized;
         var pitchError = new Vector3(0, error.y, error.z).normalized;
         var rollError = new Vector3(error.x, error.y, 0).normalized;
+        var yawError = new Vector3(error.x, 0, error.z).normalized;
 
         var targetInput = new Vector3();
 
@@ -133,7 +155,8 @@ public class AIController : MonoBehaviour {
         targetInput.x = pitch;
 
         if (Vector3.Angle(Vector3.forward, errorDir) < fineSteeringAngle) {
-            targetInput.y = error.x;
+            var yaw = Vector3.SignedAngle(Vector3.forward, yawError, Vector3.up);
+            targetInput.y = yaw * yawFactor;
         } else {
             var roll = Vector3.SignedAngle(Vector3.up, rollError, Vector3.forward);
             targetInput.z = roll * rollFactor;
@@ -176,7 +199,7 @@ public class AIController : MonoBehaviour {
 
         foreach (var offset in dodgeOffsets) {
             var dodgePosition = missilePos + offset;
-            var offsetDist = Vector3.Distance(dodgePosition, plane.Rigidbody.position);
+            var offsetDist = Vector3.Distance(dodgePosition, lastDodgePoint);
 
             if (offsetDist < min) {
                 minDodge = dodgePosition;
@@ -184,6 +207,7 @@ public class AIController : MonoBehaviour {
             }
         }
 
+        lastDodgePoint = minDodge;
         return minDodge;
     }
 
@@ -264,26 +288,67 @@ public class AIController : MonoBehaviour {
         }
     }
 
+    void SteerToTarget(float dt, Vector3 planePosition) {
+        bool foundTarget = false;
+        Vector3 steering = Vector3.zero;
+        Vector3 targetPosition = Vector3.zero;
+
+        var delay = reactionDelayMax;
+
+        if (Vector3.Distance(planePosition, plane.Rigidbody.position) < reactionDelayDistance) {
+            delay = reactionDelayMin;
+        }
+
+        while (inputQueue.Count > 0) {
+            var input = inputQueue.Peek();
+
+            if (input.time + delay <= Time.time) {
+                targetPosition = input.targetPosition;
+                inputQueue.Dequeue();
+                foundTarget = true;
+            } else {
+                break;
+            }
+        }
+
+        if (foundTarget) {
+            steering = CalculateSteering(dt, targetPosition);
+        }
+
+        plane.SetControlInput(steering);
+    }
+
     void FixedUpdate() {
         if (plane.Dead) return;
         var dt = Time.fixedDeltaTime;
 
-        Vector3 steering;
+        Vector3 steering = Vector3.zero;
         float throttle;
+        bool emergency = false;
+        Vector3 targetPosition = plane.Target.Position;
 
         var velocityRot = Quaternion.LookRotation(plane.Rigidbody.velocity.normalized);
         var ray = new Ray(plane.Rigidbody.position, velocityRot * Quaternion.Euler(groundAvoidanceAngle, 0, 0) * Vector3.forward);
 
-        if (Physics.Raycast(ray, groundCollisionDistance + plane.LocalAngularVelocity.z, groundCollisionMask.value)) {
+        if (Physics.Raycast(ray, groundCollisionDistance + plane.LocalVelocity.z, groundCollisionMask.value)) {
             steering = AvoidGround();
             throttle = CalculateThrottle(groundAvoidanceMinSpeed, groundAvoidanceMaxSpeed);
+            emergency = true;
         } else {
-            Vector3 targetPosition;
-
             var incomingMissile = selfTarget.GetIncomingMissile();
             if (incomingMissile != null) {
-                targetPosition = GetMissileDodgePosition(dt, incomingMissile);
+                if (dodging == false) {
+                    //start dodging
+                    dodging = true;
+                    lastDodgePoint = plane.Rigidbody.position;
+                    dodgeTimer = 0;
+                }
+
+                var dodgePosition = GetMissileDodgePosition(dt, incomingMissile);
+                steering = CalculateSteering(dt, dodgePosition);
+                emergency = true;
             } else {
+                dodging = false;
                 targetPosition = GetTargetPosition();
             }
 
@@ -292,14 +357,29 @@ public class AIController : MonoBehaviour {
 
                 steering = RecoverSpeed();
                 throttle = 1;
+                emergency = true;
             } else {
-                steering = CalculateSteering(dt, targetPosition);
                 throttle = CalculateThrottle(minSpeed, maxSpeed);
             }
         }
 
-        plane.SetControlInput(steering);
+        inputQueue.Enqueue(new ControlInput {
+            time = Time.time,
+            targetPosition = targetPosition,
+        });
+
         plane.SetThrottleInput(throttle);
+
+        if (emergency) {
+            if (isRecoveringSpeed) {
+                //reduce steering strength while recovering speed
+                steering.x = Mathf.Clamp(steering.x, -0.5f, 0.5f);
+            }
+
+            plane.SetControlInput(steering);
+        } else {
+            SteerToTarget(dt, plane.Target.Position);
+        }
 
         CalculateWeapons(dt);
     }
